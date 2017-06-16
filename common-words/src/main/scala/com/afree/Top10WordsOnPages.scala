@@ -4,7 +4,8 @@ import net.ruippeixotog.scalascraper.browser.JsoupBrowser
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions.count
 
 object Top10WordsOnPages {
 
@@ -33,7 +34,7 @@ object Top10WordsOnPages {
 
     println("==== SPARK SQL ====")
     val sqStart = System.currentTimeMillis()
-    sparkSqlProcessing(contents)
+    sparkSqlProcessing(contents, urls)
     val sqStop = System.currentTimeMillis()
     println(s"Spark SQL processing took ${sqStop - sqStart} ms.\n")
   }
@@ -52,39 +53,27 @@ object Top10WordsOnPages {
 
     top10ByUrl foreach {case (url, pairs) => {
         println(s"\nURL: $url")
-        println(pairs)
+        println(pairs mkString "\n")
       }
     }
   }
 
   case class Contents(url: String, word: String)
 
-  private def sparkSqlProcessing(contents: Seq[(String, String)]) = {
+  private def sparkSqlProcessing(contents: Seq[(String, String)], urls: Array[String]) = {
     val spark = SparkSession.builder().appName("Top10WordsOnPagesSQL").getOrCreate()
 
     import spark.implicits._
     val contentsDS = contents.map{case (url, word) => Contents(url, word)}.toDS()
 
-    // construct row "url", "word", "count"
-    val counts = contentsDS.groupBy("url", "word").count()
+    // construct "url", "word", "count(word)"
+    val ordered = contentsDS.groupBy("url", "word").
+                          agg(count("word")).
+                          orderBy($"url", $"count(word)".desc).
+                          persist() // in order to re-use this DataSet
 
-    import org.apache.spark.sql.functions._
-    // sort rows by url and then by count
-    val sorted = counts.sort(asc("url"), desc("count"))
-
-    // user defined function to take n first elements from a sequence
-    val limitUDF = udf { (stats: Seq[String], limit: Int) => stats.take(limit) }
-
-    // aggregate all "word", "count" pairs with the corresponding url
-    val top10ByUrl = sorted.groupBy("url").agg(
-        collect_list(concat(col("word"), lit(" "), col("count"))).alias("all")
-      // construct the column with top 10 "word", "count" pairs
-      ).withColumn("top10", limitUDF($"all", lit(10)))
-
-    top10ByUrl.select("url", "top10").collect().foreach{case Row(url, pairs) => {
-        println(s"\nURL: $url")
-        println(pairs)
-      }
+    urls.foreach{url =>
+      ordered.select("url", "word", "count(word)").where(s"url = '$url'").limit(10).show()
     }
 
     spark.stop()
